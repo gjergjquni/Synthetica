@@ -406,12 +406,33 @@ class BaseAgent:
                     updates["plan_steps"] = result["plan_steps"]
                 if "critic_feedback" in result:
                     updates["critic_feedback"] = result["critic_feedback"]
-                if "metadata" in result and isinstance(task.raw_data, dict):
-                    updates["raw_data"] = {**(task.raw_data or {}), "metadata": result["metadata"]}
+                # Shared memory / per-task timeline
+                base_raw = task.raw_data or {}
+                timeline = list(base_raw.get("timeline", []))
+                event = {
+                    "timestamp": time.time(),
+                    "agent": self.role,
+                    "effective_role": self._effective_role,
+                    "status_after": str(updates.get("status", task.status)),
+                    "summary": (result.get("reasoning") or "")[:200],
+                }
+                timeline.append(event)
+
+                raw_data = {**base_raw, "timeline": timeline}
+
+                if "metadata" in result and isinstance(base_raw, dict):
+                    raw_data["metadata"] = result["metadata"]
+
                 if "latency_ms" in result:
-                    updates.setdefault("raw_data", task.raw_data or {})
-                    if isinstance(updates.get("raw_data"), dict):
-                        updates["raw_data"] = {**(updates["raw_data"]), "latency_ms": result["latency_ms"]}
+                    raw_data["latency_ms"] = result["latency_ms"]
+
+                # Simple shared memory of each agent's latest reasoning
+                agent_memory = dict(base_raw.get("agent_memory", {}))
+                if result.get("reasoning"):
+                    agent_memory[self.role] = result["reasoning"]
+                raw_data["agent_memory"] = agent_memory
+
+                updates["raw_data"] = raw_data
 
                 await self._update_task(task.id, updates)
                 latency_ms = result.get("latency_ms")

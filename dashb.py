@@ -432,17 +432,66 @@ with st.sidebar:
     st.markdown('<div class="section-label">Scenario Inject</div>', unsafe_allow_html=True)
 
     if connected:
+        now = time.time()
+
         if st.button("🌊  Slussen Flood Event"):
-            task = {"id": "manual-001", "task": "CRITICAL: Slussen water level +1.5m. Assess Södermalm evacuation.", "target": "Scout", "status": "todo", "created_by": "OPERATOR", "result": ""}
-            r.set("blackboard", json.dumps([task]))
+            task = {
+                "id": "TASK_DASHB_SLUSSEN_001",
+                "status": "TODO",
+                "location": "Slussen/Gamla Stan",
+                "raw_data": {
+                    "description": "CRITICAL: Slussen water level +1.5m. Assess Södermalm evacuation.",
+                    "source": "Dashboard",
+                    "timestamp": now,
+                },
+                "plan_steps": [],
+                "critic_feedback": None,
+                "reasoning": None,
+                "assigned_agent": None,
+                "timestamp": now,
+                "risk_level": 8,
+            }
+            r.set(f"blackboard:task:{task['id']}", json.dumps(task))
             st.rerun()
+
         if st.button("⚡  City Power Outage"):
-            task = {"id": "manual-002", "task": "ALERT: Grid instability. 4 districts entering brownout. Assess hospital backup power.", "target": "Scout", "status": "todo", "created_by": "OPERATOR", "result": ""}
-            r.set("blackboard", json.dumps([task]))
+            task = {
+                "id": "TASK_DASHB_POWER_001",
+                "status": "TODO",
+                "location": "Stockholm Grid",
+                "raw_data": {
+                    "description": "ALERT: Grid instability. 4 districts entering brownout. Assess hospital backup power.",
+                    "source": "Dashboard",
+                    "timestamp": now,
+                },
+                "plan_steps": [],
+                "critic_feedback": None,
+                "reasoning": None,
+                "assigned_agent": None,
+                "timestamp": now,
+                "risk_level": 7,
+            }
+            r.set(f"blackboard:task:{task['id']}", json.dumps(task))
             st.rerun()
+
         if st.button("🚇  Metro System Failure"):
-            task = {"id": "manual-003", "task": "Tunnelbana lines T10/T11/T14 signal failure. 180,000 passengers affected. Plan reroute.", "target": "Scout", "status": "todo", "created_by": "OPERATOR", "result": ""}
-            r.set("blackboard", json.dumps([task]))
+            task = {
+                "id": "TASK_DASHB_METRO_001",
+                "status": "TODO",
+                "location": "Tunnelbana T10/T11/T14",
+                "raw_data": {
+                    "description": "Tunnelbana lines T10/T11/T14 signal failure. 180,000 passengers affected. Plan reroute.",
+                    "source": "Dashboard",
+                    "timestamp": now,
+                },
+                "plan_steps": [],
+                "critic_feedback": None,
+                "reasoning": None,
+                "assigned_agent": None,
+                "timestamp": now,
+                "risk_level": 9,
+            }
+            r.set(f"blackboard:task:{task['id']}", json.dumps(task))
             st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -499,21 +548,39 @@ agent_roles = {
     "Specialist": "Redundancy Agent",
 }
 
-alive_agents = [a for a in agents if r.exists(f"heartbeat:{a}")]
+alive_agents = [a for a in agents if r.exists(f"heartbeat:{a.lower()}")]
 n_alive = len(alive_agents)
 
-# Parse blackboard for task counts
-raw_board = r.get("blackboard")
+# Parse blackboard for task counts (Synthetica v2 schema: blackboard:task:{id})
 tasks = []
-if raw_board:
-    try:
-        tasks = json.loads(raw_board)
-    except Exception:
-        tasks = []
+cursor = 0
+while True:
+    cursor, keys = r.scan(cursor=cursor, match="blackboard:task:*", count=100)
+    for key in keys:
+        raw = r.get(key)
+        if not raw:
+            continue
+        try:
+            tasks.append(json.loads(raw))
+        except Exception:
+            continue
+    if cursor == 0:
+        break
 
-n_done  = sum(1 for t in tasks if t.get("status") == "done")
-n_todo  = sum(1 for t in tasks if t.get("status") == "todo")
-n_doing = sum(1 for t in tasks if t.get("status") == "doing")
+# Map Synthetica TaskStatus to dashboard buckets
+def _status_bucket(t):
+    s = (t.get("status") or "").upper()
+    if s == "VALIDATED":
+        return "done"
+    if s in ("TODO",):
+        return "todo"
+    if s in ("IN_PROGRESS", "NEEDS_PLAN", "REVIEW", "STUCK"):
+        return "doing"
+    return "todo"
+
+n_done  = sum(1 for t in tasks if _status_bucket(t) == "done")
+n_todo  = sum(1 for t in tasks if _status_bucket(t) == "todo")
+n_doing = sum(1 for t in tasks if _status_bucket(t) == "doing")
 
 approval_pending = r.exists("approval_needed")
 
@@ -560,7 +627,9 @@ st.markdown('<div class="section-label">02 · SWARM AGENT STATUS</div>', unsafe_
 
 cols = st.columns(4)
 for i, role in enumerate(agents):
-    is_alive = r.exists(f"heartbeat:{role}")
+    # Heartbeats are written by swarm as lowercase role names (scout, architect, ...)
+    hb_key = f"heartbeat:{role.lower()}"
+    is_alive = r.exists(hb_key)
     status_class = "online" if is_alive else "offline"
     status_text  = "OPERATIONAL" if is_alive else "OFFLINE"
     indicator_class = "online" if is_alive else "offline"
@@ -586,16 +655,22 @@ left_col, right_col = st.columns([3, 2])
 
 with left_col:
     if tasks:
-        # Sanitise for display
+        # Sanitise for display using Synthetica v2 task schema
         display_tasks = []
         for t in tasks:
+            raw = t.get("raw_data") or {}
+            desc = raw.get("description", "—")
+            reasoning = (t.get("reasoning") or "")[:50]
+            if reasoning and len(t.get("reasoning") or "") > 50:
+                reasoning += "…"
+            status = (t.get("status") or "—").upper()
             display_tasks.append({
-                "ID":         t.get("id", "—")[:12],
-                "Task":       t.get("task", "—")[:60] + ("…" if len(t.get("task","")) > 60 else ""),
-                "Target":     t.get("target", "—"),
-                "Status":     t.get("status", "—").upper(),
-                "Confidence": f"{int(t.get('confidence', 0) * 100)}%" if t.get("confidence") else "—",
-                "Result":     t.get("result", "—")[:50] + ("…" if len(t.get("result","")) > 50 else ""),
+                "ID":         str(t.get("id", "—"))[:18],
+                "Task":       desc[:60] + ("…" if len(desc) > 60 else ""),
+                "Status":     status,
+                "Risk":       t.get("risk_level", "—"),
+                "Assigned":   t.get("assigned_agent", "—"),
+                "Result":     reasoning or "—",
             })
         st.dataframe(
             display_tasks,
@@ -619,6 +694,39 @@ with right_col:
     st.code(log_display, language="text")
 
 st.markdown("<br>", unsafe_allow_html=True)
+
+# Optional detail view for a single task
+if tasks:
+    st.markdown('<div class="section-label">03B · SELECTED INCIDENT DETAIL</div>', unsafe_allow_html=True)
+    task_ids = [t.get("id", "—") for t in tasks]
+    selected_id = st.selectbox("Select incident", task_ids, index=0)
+    selected = next((t for t in tasks if t.get("id") == selected_id), None)
+    if selected:
+        raw = selected.get("raw_data") or {}
+        st.markdown(f"**ID:** `{selected.get('id')}`  \n"
+                    f"**Status:** `{(selected.get('status') or '').upper()}`  \n"
+                    f"**Location:** `{selected.get('location') or '—'}`  \n"
+                    f"**Assigned Agent:** `{selected.get('assigned_agent') or '—'}`  \n"
+                    f"**Risk Level:** `{selected.get('risk_level') or '—'}`")
+
+        desc = raw.get("description")
+        if desc:
+            st.markdown(f"**Description**  \n{desc}")
+
+        if selected.get("plan_steps"):
+            st.markdown("**Plan Steps (Architect)**")
+            for i, step in enumerate(selected["plan_steps"], start=1):
+                st.markdown(f"{i}. {step}")
+
+        if selected.get("critic_feedback"):
+            st.markdown("**Critic Feedback**")
+            st.markdown(selected["critic_feedback"])
+
+        if selected.get("reasoning"):
+            st.markdown("**Agent Reasoning (truncated)**")
+            st.code(selected["reasoning"], language="text")
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
 #  SECTION 4 — HUMAN-IN-THE-LOOP

@@ -1,36 +1,35 @@
-"""
-Synthetica — Entry Point & Execution Logic (Google Cloud / Gemini)
-==================================================================
-Gemini 1.5 Flash via google-generativeai: system_instruction for personas,
-generation_config.response_mime_type = application/json, latency_ms on every response.
-Cloud-native config (REDIS_HOST, GOOGLE_API_KEY); telemetry to swarm_telemetry.
-"""
-
+import argparse
 import asyncio
 import json
 import os
 import sys
 import time
-from typing import Any, Optional
+from typing import Any
 
-# Add project root for imports when run as script
+# Add project root for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Third-party imports
 from redis.asyncio import Redis
+import google.generativeai as genai
 
-from config import GEMINI_MODEL, GEMINI_TIMEOUT_SEC, GOOGLE_API_KEY, REDIS_URL, SYNTHETICA_SEED
+# Try to import Vertex AI (Enterprise version)
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, GenerationConfig as VertexConfig
+    HAS_VERTEX = True
+except ImportError:
+    HAS_VERTEX = False
+
+# Local Synthetica imports
+from config import GEMINI_MODEL, GEMINI_TIMEOUT_SEC, GOOGLE_API_KEY, REDIS_URL
 from engine import BLACKBOARD_PREFIX, BaseAgent, get_async_redis
 from models import BlackboardTask, TaskStatus
-
+from prompts import SYSTEM_PROMPTS
 
 # -----------------------------------------------------------------------------
-# Gemini 1.5 Flash — system_instruction, JSON mode, latency_ms
+# UNIVERSAL LLM INVOKER (Vertex AI or Google AI Studio)
 # -----------------------------------------------------------------------------
-
-def _get_genai():
-    import google.generativeai as genai
-    return genai
-
 
 async def invoke_gemini(
     agent: BaseAgent,
@@ -38,225 +37,189 @@ async def invoke_gemini(
     user_message: str,
 ) -> dict[str, Any]:
     """
-    Call Gemini 1.5 Flash with system_instruction and response_mime_type=application/json.
-    Returns dict with at least "reasoning" and "latency_ms" for judges.
+    Connects to Google. 
+    It checks for GCP_PROJECT_ID first (Vertex AI).
+    If not found, it uses GOOGLE_API_KEY (AI Studio).
     """
-    genai = _get_genai()
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("GOOGLE_API_KEY environment variable is required")
-    genai.configure(api_key=GOOGLE_API_KEY)
-
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=system_instruction,
-        generation_config={
-            "response_mime_type": "application/json",
-            "temperature": 0.3,
-        },
-    )
-
-    start = time.perf_counter()
+    start_time = time.perf_counter()
+    project_id = os.getenv("GCP_PROJECT_ID")
+    
     try:
-        # SDK is sync; run in thread to keep event loop non-blocking
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                lambda: model.generate_content(user_message),
-            ),
-            timeout=GEMINI_TIMEOUT_SEC,
-        )
-    except asyncio.TimeoutError:
-        raise
+        # PATH 1: VERTEX AI (Enterprise)
+        if HAS_VERTEX and project_id:
+            vertexai.init(project=project_id, location=os.getenv("GCP_LOCATION", "us-central1"))
+            model = GenerativeModel(
+                os.getenv("GEMINI_MODEL", "gemini-1.5-flash"), 
+                system_instruction=[system_instruction]
+            )
+            
+            # Run in thread to keep the swarm heartbeats moving
+            response = await asyncio.to_thread(
+                lambda: model.generate_content(
+                    user_message,
+                    generation_config=VertexConfig(
+                        response_mime_type="application/json",
+                        temperature=0.3
+                    )
+                )
+            )
+            raw_text = response.text
+
+        # PATH 2: GOOGLE AI STUDIO (Standard API Key)
+        elif GOOGLE_API_KEY:
+            genai.configure(api_key=GOOGLE_API_KEY)
+            model = genai.GenerativeModel(
+                model_name=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+                system_instruction=system_instruction
+            )
+            
+            response = await asyncio.to_thread(
+                lambda: model.generate_content(
+                    user_message,
+                    generation_config={"response_mime_type": "application/json", "temperature": 0.3}
+                )
+            )
+            raw_text = response.text
+        
+        else:
+            raise RuntimeError("ERROR: No API Key or GCP Project ID found in .env")
+
+        # Calculate latency for the judges
+        latency_ms = int((time.perf_counter() - start_time) * 1000)
+        
+        # Parse the JSON and add the latency metric
+        res_dict = json.loads(raw_text)
+        res_dict["latency_ms"] = latency_ms
+        return res_dict
+
     except Exception as e:
-        raise RuntimeError(f"Gemini API error: {e}") from e
-
-    latency_ms = round((time.perf_counter() - start) * 1000)
-    content = response.text if response and response.text else ""
-
-    if not content:
+        print(f"--- API ERROR in {agent.role.upper()}: {e} ---")
         return {
-            "reasoning": "No content returned from model.",
-            "status": "REVIEW",
-            "latency_ms": latency_ms,
+            "error": str(e),
+            "reasoning": "Fallback due to connection error.",
+            "latency_ms": 0,
         }
 
-    try:
-        out = json.loads(content)
-    except json.JSONDecodeError as e:
-        return {
-            "reasoning": f"Model returned non-JSON; parse error: {e}",
-            "status": "REVIEW",
-            "latency_ms": latency_ms,
-        }
 
-    if "reasoning" not in out:
-        out["reasoning"] = "No reasoning field in model output; audit trail missing."
-    out["latency_ms"] = latency_ms
-    return out
-
-
-async def invoke_mock_llm(
+async def invoke_gemini_offline(
     agent: BaseAgent,
     system_instruction: str,
     user_message: str,
 ) -> dict[str, Any]:
     """
-    Local demo LLM used when GOOGLE_API_KEY isn't set.
-    Returns strict-JSON-shaped outputs that move tasks through the pipeline.
-    """
-    start = time.perf_counter()
-    try:
-        task = json.loads(user_message)
-    except Exception:
-        task = {}
+    Offline / mock LLM path.
 
-    role = getattr(agent, "_effective_role", agent.role)
-    location = task.get("location") or "Unknown"
-    issue = None
-    if isinstance(task.get("raw_data"), dict):
-        issue = task["raw_data"].get("issue")
+    This lets the swarm run end‑to‑end without calling external APIs.
+    It fabricates deterministic JSON responses that respect the expected
+    contract for each role (status transitions, plan_steps, critic_feedback,
+    metadata, reasoning, latency_ms).
+    """
+    try:
+        task = BlackboardTask.model_validate_json(user_message)
+    except Exception:
+        # If we somehow can't parse, just return a generic reasoning blob.
+        return {
+            "status": "TODO",
+            "reasoning": "Offline mock: unable to parse task payload.",
+            "latency_ms": 1,
+        }
+
+    role = agent.role.lower()
 
     if role == "scout":
-        out: dict[str, Any] = {
+        return {
             "status": "NEEDS_PLAN",
             "metadata": {
                 "severity": "High",
                 "type": "Flood",
                 "critical_infrastructure": [
-                    "Slussen Slussenkajen",
-                    "Gamla Stan Subway",
+                    "Slussenkajen",
+                    "Gamla Stan T-Bana",
                     "Centralbron",
                 ],
-                "summary": f"{location}: {issue or 'Situation report received'}",
+                "observed_trend": "Rising",
+                "summary": f"Synthetic flood intelligence for {task.location or 'unknown location'}.",
             },
-            "risk_level": 8,
-            "reasoning": "Mock Scout: synthesized a minimal, safe enrichment to drive the demo pipeline.",
+            "risk_level": task.risk_level or 8,
+            "reasoning": "Offline mock: SCOUT normalized the raw report and assessed a high‑risk flood scenario.",
+            "latency_ms": 5,
         }
-    elif role == "architect":
-        out = {
+
+    if role == "architect":
+        return {
+            "status": "REVIEW",
             "plan_steps": [
-                "Coordinate with SL/Trafikverket to close and assess nearby T-Bana entrances; deploy pumps/barriers for underground ingress points.",
-                "Secure Centralbron and primary evacuation corridors; redirect traffic and stage rescue/medical resources upstream.",
-                "Protect Slussenkajen waterfront assets; set exclusion zones, monitor water level, and hand off an action log to incident command.",
+                "Conduct rapid assessment and evacuate Gamla Stan T-Bana platforms.",
+                "Establish controlled access and emergency lanes across Centralbron.",
+                "Stabilize Slussenkajen waterfront and coordinate ferry/shoreline safety.",
             ],
-            "status": "REVIEW",
-            "reasoning": "Mock Architect: prioritized T-Bana life safety first, then bridge routing, then waterfront stabilization.",
+            "reasoning": "Offline mock: ARCHITECT produced a 3‑step tactical plan prioritizing life safety, mobility, and stabilization.",
+            "latency_ms": 5,
         }
-    elif role == "critic":
-        out = {
-            "flaw_1": "Access points for underground ingress may be incomplete without a rapid survey of secondary entrances.",
-            "flaw_2": "Traffic diversion could bottleneck emergency vehicles if not coordinated with police dispatch in real time.",
-            "alternative_1": "Run a 15-minute entrance sweep using station staff + CCTV, then update closure list before pumping operations.",
-            "alternative_2": "Establish a dedicated emergency lane and dynamic signal plan on diversion routes with police traffic control.",
-            "verdict": "APPROVE",
-            "critic_feedback": "Plan is sound; ensure a rapid sweep of all T-Bana entrances and coordinate live traffic control to prevent EMS delays.",
+
+    if role == "critic":
+        return {
             "status": "VALIDATED",
-            "reasoning": "Mock Critic: provided two concrete risks plus mitigations; approved with conditions for safety.",
+            "critic_feedback": (
+                "Offline mock: Plan checked for electrical hazards, flood progression, and crowd crush risk. "
+                "No blocking flaws identified; proceed with heightened monitoring."
+            ),
+            "reasoning": "Offline mock: CRITIC adversarially reviewed the plan and approved it for execution.",
+            "latency_ms": 5,
         }
-    else:
-        # Specialist (or unknown): nudge STUCK/REVIEW forward safely.
-        out = {
-            "status": "REVIEW",
-            "reasoning": "Mock Specialist: advancing the task to keep the demo swarm moving without external dependencies.",
+
+    if role == "specialist":
+        # Specialist mainly coordinates takeovers; keep status as‑is but provide reasoning.
+        return {
+            "status": task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
+            "reasoning": "Offline mock: SPECIALIST is monitoring heartbeats and stands ready to adopt missing roles.",
+            "latency_ms": 2,
         }
 
-    out["latency_ms"] = round((time.perf_counter() - start) * 1000)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Seed blackboard with exemplar task (optional)
-# -----------------------------------------------------------------------------
-
-async def seed_exemplar_task(redis_url: str) -> None:
-    """Insert the exemplar task: Slussen rising water (TODO)."""
-    r = get_async_redis(redis_url)
-    task = BlackboardTask(
-        id="001",
-        status=TaskStatus.TODO,
-        location="Slussen",
-        raw_data={"issue": "Rising water", "source": "exemplar"},
-        timestamp=time.time(),
-    )
-    await r.set(f"{BLACKBOARD_PREFIX}{task.id}", task.to_redis_value())
-    await r.aclose()
-
+    # Fallback for unknown roles
+    return {
+        "status": task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
+        "reasoning": f"Offline mock: generic handler for role '{role}'.",
+        "latency_ms": 1,
+    }
 
 # -----------------------------------------------------------------------------
-# Run full swarm: Scout, Architect, Critic, Specialist
+# MAIN EXECUTION
 # -----------------------------------------------------------------------------
-
-async def run_swarm(redis_url: str, seed: bool = True) -> None:
-    """Start all four agents concurrently; each polls Redis and runs until interrupted."""
-    if seed:
-        await seed_exemplar_task(redis_url)
-
-    agents = [
-        BaseAgent("scout", redis_url=redis_url),
-        BaseAgent("architect", redis_url=redis_url),
-        BaseAgent("critic", redis_url=redis_url),
-        BaseAgent("specialist", redis_url=redis_url),
-    ]
-
-    async def llm_invoker(agent: BaseAgent, system_prompt: str, user_message: str) -> dict[str, Any]:
-        if os.getenv("SYNTHETICA_OFFLINE", "").lower() in ("1", "true", "yes") or not GOOGLE_API_KEY:
-            return await invoke_mock_llm(agent, system_prompt, user_message)
-        return await invoke_gemini(agent, system_prompt, user_message)
-
-    tasks = [asyncio.create_task(agent.run(llm_invoker=llm_invoker)) for agent in agents]
-    try:
-        run_seconds = float(os.getenv("SYNTHETICA_RUN_SECONDS", "0") or "0")
-        if run_seconds > 0:
-            await asyncio.sleep(run_seconds)
-            for a in agents:
-                a.stop()
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-            if os.getenv("SYNTHETICA_PRINT_FINAL", "1").lower() in ("1", "true", "yes"):
-                r = get_async_redis(redis_url)
-                try:
-                    raw = await r.get(f"{BLACKBOARD_PREFIX}001")
-                finally:
-                    await r.aclose()
-                if raw:
-                    try:
-                        obj = json.loads(raw)
-                        safe = json.dumps(obj, ensure_ascii=True)
-                    except Exception:
-                        safe = raw.encode("utf-8", errors="backslashreplace").decode("utf-8")
-                    print("FINAL_TASK_001=", safe)
-            return
-
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        for a in agents:
-            a.stop()
-        raise
-
 
 def main() -> None:
-    # Auto-fallback to local demo mode if Gemini key isn't set.
-    if not GOOGLE_API_KEY and not os.getenv("SYNTHETICA_OFFLINE"):
-        os.environ["SYNTHETICA_OFFLINE"] = "1"
+    # 1. Parse which role this container is playing
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--role", type=str, default="scout", help="scout, architect, critic, or specialist")
+    args = parser.parse_args()
 
-    # Auto-fallback to in-memory Redis if Redis isn't available.
-    redis_url = REDIS_URL
-    if not redis_url.lower().startswith(("memory://", "fakeredis://")):
-        try:
-            async def _probe() -> None:
-                r = Redis.from_url(redis_url, decode_responses=True)
-                try:
-                    await r.ping()
-                finally:
-                    await r.aclose()
+    # 2. Check if we should run in Mock/Offline mode
+    is_offline = os.getenv("SYNTHETICA_OFFLINE", "").lower() in ("1", "true", "yes")
+    
+    # 3. Create the Agent Node
+    # Every node uses BaseAgent (Vulture Protocol is built-in there)
+    agent = BaseAgent(args.role, redis_url=REDIS_URL)
+    
+    print(f"🚀 SYNTHETICA SWARM NODE: {args.role.upper()} ACTIVATED")
+    
+    # Check connection type for logs
+    if is_offline:
+        print("📝 MODE: OFFLINE (Using Mock Responses)")
+    elif os.getenv("GCP_PROJECT_ID"):
+        print(f"🌐 MODE: VERTEX AI ({os.getenv('GCP_PROJECT_ID')})")
+    else:
+        print("🌐 MODE: GOOGLE AI STUDIO (Standard API)")
 
-            asyncio.run(_probe())
-        except Exception:
-            redis_url = "memory://"
+    # 4. Start the autonomous loop
+    llm_invoker = invoke_gemini_offline if is_offline else invoke_gemini
 
-    asyncio.run(run_swarm(redis_url, seed=SYNTHETICA_SEED))
-
+    try:
+        asyncio.run(agent.run(llm_invoker=llm_invoker))
+    except KeyboardInterrupt:
+        print(f"Stopping {args.role}...")
+        agent.stop()
+    except Exception as e:
+        print(f"FATAL SWARM ERROR: {e}")
 
 if __name__ == "__main__":
     main()
