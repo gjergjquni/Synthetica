@@ -1,0 +1,25 @@
+# Environment and secrets
+.env
+.env.*
+
+# Embedded upstream (add as submodule if needed)
+Synthetica-upstream/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

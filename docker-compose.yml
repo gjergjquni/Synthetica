@@ -1,0 +1,89 @@
+services:
+  redis:
+    image: redis:alpine
+    container_name: swarm_blackboard
+    ports:
+      - "6379:6379"
+      
+    networks:
+      - swarm_net
+
+  # Agent 1: The Scout
+  scout:
+    build: .
+    command: python main.py --role scout
+    environment:
+      - REDIS_HOST=redis
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - GEMINI_TIMEOUT_SEC=${GEMINI_TIMEOUT_SEC}
+      - SYNTHETICA_OFFLINE=${SYNTHETICA_OFFLINE}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GCP_LOCATION=${GCP_LOCATION}
+      - GOOGLE_SEARCH_API_KEY=${GOOGLE_SEARCH_API_KEY}
+      - GOOGLE_SEARCH_CX=${GOOGLE_SEARCH_CX}
+    depends_on:
+      - redis
+    networks:
+      - swarm_net
+
+  # Agent 2: The Architect
+  architect:
+    build: .
+    command: python main.py --role architect
+    environment:
+      - REDIS_HOST=redis
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - GEMINI_TIMEOUT_SEC=${GEMINI_TIMEOUT_SEC}
+      - SYNTHETICA_OFFLINE=${SYNTHETICA_OFFLINE}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GCP_LOCATION=${GCP_LOCATION}
+      - GOOGLE_SEARCH_API_KEY=${GOOGLE_SEARCH_API_KEY}
+      - GOOGLE_SEARCH_CX=${GOOGLE_SEARCH_CX}
+    depends_on:
+      - redis
+    networks:
+      - swarm_net
+
+  # Agent 3: The Critic
+  critic:
+    build: .
+    command: python main.py --role critic
+    environment:
+      - REDIS_HOST=redis
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - GEMINI_TIMEOUT_SEC=${GEMINI_TIMEOUT_SEC}
+      - SYNTHETICA_OFFLINE=${SYNTHETICA_OFFLINE}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GCP_LOCATION=${GCP_LOCATION}
+      - GOOGLE_SEARCH_API_KEY=${GOOGLE_SEARCH_API_KEY}
+      - GOOGLE_SEARCH_CX=${GOOGLE_SEARCH_CX}
+    depends_on:
+      - redis
+    networks:
+      - swarm_net
+
+  # Agent 4: The Specialist
+  specialist:
+    build: .
+    command: python main.py --role specialist
+    environment:
+      - REDIS_HOST=redis
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - GEMINI_TIMEOUT_SEC=${GEMINI_TIMEOUT_SEC}
+      - SYNTHETICA_OFFLINE=${SYNTHETICA_OFFLINE}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GCP_LOCATION=${GCP_LOCATION}
+      - GOOGLE_SEARCH_API_KEY=${GOOGLE_SEARCH_API_KEY}
+      - GOOGLE_SEARCH_CX=${GOOGLE_SEARCH_CX}
+    depends_on:
+      - redis
+    networks:
+      - swarm_net
+
+networks:
+  swarm_net:
+    driver: bridge
