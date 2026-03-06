@@ -1,4 +1,4 @@
-## Synthetica Swarm — Multi‑Agent Crisis Blackboard
+## Synthetica Swarm  Multi‑Agent Crisis Blackboard
 
 Synthetica is a **multi‑agent crisis decision system** powered by Gemini, running on a **Redis blackboard** and orchestrated with **Docker Compose**.  
 This repo wraps the upstream `Synthetica` swarm and adds a clean, batteries‑included way to run, seed, and inspect emergencies from your local machine.
@@ -36,4 +36,5 @@ To use the helper scripts (`seed_swarm.py`, `test_connection.py`, `inspect_black
 
 ```bash
 pip install -r Synthetica-upstream/synthetica/requirements.txt
+
 
